@@ -34,6 +34,7 @@ use once_cell::sync::OnceCell;
 use thiserror::Error;
 use tracing::instrument;
 
+use self::dirty_cell::DirtyCell;
 use crate::backend::Backend;
 use crate::backend::BackendError;
 use crate::backend::BackendInitError;
@@ -79,7 +80,6 @@ use crate::op_store::RefTarget;
 use crate::op_store::RemoteRef;
 use crate::op_store::RemoteRefState;
 use crate::op_store::RootOperationData;
-use crate::op_walk;
 use crate::operation::Operation;
 use crate::ref_name::GitRefName;
 use crate::ref_name::RefName;
@@ -766,20 +766,10 @@ impl RepoLoader {
         let op = op_heads_store::resolve_op_heads(
             self.op_heads_store.as_ref(),
             &self.op_store,
-            async |op_heads| -> Result<Operation, RepoLoaderError> {
-                assert!(op_heads.len() > 1);
-                let workspace_name = None;
-                let transaction_description = Some("reconcile divergent operations");
-                let transaction_attributes = [];
-                let (merged_repo, _num_rebased) = self
-                    .merge_operations(
-                        op_heads,
-                        workspace_name,
-                        transaction_description,
-                        transaction_attributes,
-                    )
-                    .await?;
-                Ok(merged_repo.operation().clone())
+            async |op_heads| {
+                assert!(!op_heads.is_empty());
+                self.merge_operations(op_heads, Some("reconcile divergent operations"))
+                    .await
             },
         )
         .await?;
@@ -825,126 +815,36 @@ impl RepoLoader {
         Ok(Operation::new(self.op_store.clone(), id.clone(), data))
     }
 
-    /// Merges the given `operations`. Returns the merged repo and the number of
-    /// rebased commits. If `operations` is empty returns the root repo. If
-    /// `operations` has a single entry, returns that entry's repo. Otherwise
-    /// an actual merge happens. The new operation is not published.
+    /// Merges the given `operations` into a single operation. Returns the root
+    /// operation if the `operations` is empty.
     pub async fn merge_operations(
         &self,
         operations: Vec<Operation>,
-        workspace_name: Option<&WorkspaceName>,
-        transaction_description: Option<&str>,
-        transaction_attributes: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<(Arc<ReadonlyRepo>, usize), RepoLoaderError> {
-        // IMPLEMENTATION NOTE: This used to be implemented as a much simple
-        // recursive method, but unfortunately due to the async nature of the
-        // method itself and its dependencies, that leads to stack-overflow in
-        // some cases. See https://github.com/jj-vcs/jj/pull/9586 for more
-        // details.
-        match &operations[..] {
-            [] => {
-                let root_operation = self.root_operation().await;
-                let root_repo = self.load_at(&root_operation).await?;
-                return Ok((root_repo, 0));
+        tx_description: Option<&str>,
+    ) -> Result<Operation, RepoLoaderError> {
+        let num_operations = operations.len();
+        let mut operations = operations.into_iter();
+        let Some(base_op) = operations.next() else {
+            return Ok(self.root_operation().await);
+        };
+        let final_op = if num_operations > 1 {
+            let base_repo = self.load_at(&base_op).await?;
+            let mut tx = base_repo.start_transaction();
+            for other_op in operations {
+                tx.merge_operation(other_op).await?;
+                tx.repo_mut().rebase_descendants().await?;
             }
-            [op] => {
-                let repo = self.load_at(op).await?;
-                return Ok((repo, 0));
-            }
-            _ => {}
-        }
+            let tx_description = tx_description.map_or_else(
+                || format!("merge {num_operations} operations"),
+                |tx_description| tx_description.to_string(),
+            );
+            let merged_repo = tx.write(tx_description).await?.leave_unpublished();
+            merged_repo.operation().clone()
+        } else {
+            base_op
+        };
 
-        let mut num_rebased = 0;
-        let to_operation_ids =
-            |ops: &[Operation]| ops.iter().map(|op| op.id().clone()).collect_vec();
-        let operation_ids = to_operation_ids(&operations);
-
-        // Caches the result of merging some operations.
-        let mut merged_operations: HashMap<Vec<OperationId>, Operation> = HashMap::new();
-        // Caches the result of op_walk::closest_common_ancestors invocations. Keyed by
-        // the arguments to that method.
-        let mut closest_common_ancestors: HashMap<_, Vec<Operation>> = HashMap::new();
-
-        let mut tx = self.load_at(&operations[0]).await?.start_transaction();
-        if let Some(workspace_name) = workspace_name {
-            tx.set_workspace_name(workspace_name);
-        }
-        for (key, value) in transaction_attributes {
-            tx.set_attribute(key, value);
-        }
-        let mut stack = vec![(1, operations, tx)];
-
-        while let Some((index, operations, mut tx)) = stack.pop() {
-            assert!(operations.len() > 1);
-            assert!(index <= operations.len());
-            if index == operations.len() {
-                // We are done processing the operations, but there is more work on the stack.
-                // Commit the transaction and cache the result.
-                let tx_description = transaction_description.map_or_else(
-                    || format!("merge {} operations", operations.len()),
-                    |tx_description| tx_description.to_string(),
-                );
-                let merged_repo = tx.write(tx_description).await?.leave_unpublished();
-                merged_operations.insert(
-                    to_operation_ids(&operations),
-                    merged_repo.operation().clone(),
-                );
-                continue;
-            }
-
-            let other_op = &operations[index];
-
-            // Get the ancestor operations between the operations we have merged so far
-            // (represented by `tx.parent_ops()`) and the next operation to merge
-            // (`other_op`).
-            let ancestor_ops = match closest_common_ancestors
-                .entry((to_operation_ids(tx.parent_ops()), other_op.id().clone()))
-            {
-                Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
-                Entry::Vacant(vacant_entry) => {
-                    let ancestor_ops = op_walk::closest_common_ancestors(
-                        tx.parent_ops().to_vec(),
-                        [other_op.clone()],
-                    )
-                    .await?;
-                    vacant_entry.insert(ancestor_ops.clone())
-                }
-            };
-            assert!(!ancestor_ops.is_empty());
-
-            let ancestor_op = if let [ancestor_op] = ancestor_ops.as_slice() {
-                // There is a single common ancestor.
-                Some(ancestor_op)
-            } else {
-                // There are multiple common ancestors, check to see if we have cached their
-                // merge result.
-                let ancestor_op_ids = ancestor_ops.iter().map(|op| op.id().clone()).collect_vec();
-                merged_operations.get(&ancestor_op_ids)
-            };
-
-            if let Some(merged_ancestor_op) = ancestor_op {
-                // We have the merge of the ancestor operations. We can proceed to merge with
-                // other_op.
-                tx.merge_operation(merged_ancestor_op, other_op).await?;
-                num_rebased += tx.repo_mut().rebase_descendants().await?;
-                // Push state on the stack to continue merging the rest of the operations.
-                stack.push((index + 1, operations, tx));
-                continue;
-            }
-
-            // We have to merge the ancestor ops.
-            // We first push the current state to the stack so that after we merge the
-            // ancestor ops, we can continue merging the rest of the operations.
-            stack.push((index, operations, tx));
-            // Then we push the ancestor ops to the stack so that we can merge them first.
-            // We need to start a separate transaction for this.
-            let new_tx = self.load_at(&ancestor_ops[0]).await?.start_transaction();
-            stack.push((1, ancestor_ops.clone(), new_tx));
-        }
-
-        // We are all done! The result should be in the cache.
-        let merged_operation = merged_operations.get(&operation_ids).cloned().unwrap();
-        Ok((self.load_at(&merged_operation).await?, num_rebased))
+        Ok(final_op)
     }
 
     async fn finish_load(
@@ -993,7 +893,7 @@ impl Rewrite {
 pub struct MutableRepo {
     base_repo: Arc<ReadonlyRepo>,
     index: Box<dyn MutableIndex>,
-    view: View,
+    view: DirtyCell<View>,
     /// Mapping from new commit to its predecessors.
     ///
     /// This is similar to (the reverse of) `parent_mapping`, but
@@ -1012,11 +912,12 @@ pub struct MutableRepo {
 
 impl MutableRepo {
     pub fn new(base_repo: Arc<ReadonlyRepo>, index: &dyn ReadonlyIndex, view: &View) -> Self {
+        let mut_view = view.clone();
         let mut_index = index.start_modification();
         Self {
             base_repo,
             index: mut_index,
-            view: view.clone(),
+            view: DirtyCell::with_clean(mut_view),
             commit_predecessors: Default::default(),
             parent_mapping: Default::default(),
         }
@@ -1024,6 +925,10 @@ impl MutableRepo {
 
     pub fn base_repo(&self) -> &Arc<ReadonlyRepo> {
         &self.base_repo
+    }
+
+    fn view_mut(&mut self) -> &mut View {
+        self.view.get_mut()
     }
 
     pub fn mutable_index(&self) -> &dyn MutableIndex {
@@ -1035,21 +940,21 @@ impl MutableRepo {
     }
 
     pub fn has_changes(&self) -> bool {
+        self.view.ensure_clean(|v| self.enforce_view_invariants(v));
         !(self.commit_predecessors.is_empty()
             && self.parent_mapping.is_empty()
             && self.view() == &self.base_repo.view)
     }
 
-    #[expect(clippy::type_complexity)]
-    pub(crate) fn consume(
-        mut self,
-    ) -> IndexResult<(
+    pub fn consume(
+        self,
+    ) -> (
         Box<dyn MutableIndex>,
         View,
         BTreeMap<CommitId, Vec<CommitId>>,
-    )> {
-        self.normalize_heads()?;
-        Ok((self.index, self.view, self.commit_predecessors))
+    ) {
+        self.view.ensure_clean(|v| self.enforce_view_invariants(v));
+        (self.index, self.view.into_inner(), self.commit_predecessors)
     }
 
     /// Returns a [`CommitBuilder`] to write new commit to the repo.
@@ -1150,13 +1055,6 @@ impl MutableRepo {
         self.rewritten_ids_with(old_ids, |rewrite| !matches!(rewrite, Rewrite::Divergent(_)))
     }
 
-    fn normalize_heads(&mut self) -> IndexResult<()> {
-        self.view.normalize_heads(
-            self.index.as_index(),
-            self.base_repo.store().root_commit_id(),
-        )
-    }
-
     fn rewritten_ids_with(
         &self,
         old_ids: &[CommitId],
@@ -1251,14 +1149,13 @@ impl MutableRepo {
     async fn update_all_references(&mut self, options: &RewriteRefsOptions) -> BackendResult<()> {
         let rewrite_mapping = self.resolve_rewrite_mapping_with(|_| true)?;
         self.update_local_bookmarks(&rewrite_mapping, options)
-            .await
             // TODO: indexing error shouldn't be a "BackendError"
             .map_err(|err| BackendError::Other(err.into()))?;
         self.update_wc_commits(&rewrite_mapping).await?;
         Ok(())
     }
 
-    async fn update_local_bookmarks(
+    fn update_local_bookmarks(
         &mut self,
         rewrite_mapping: &HashMap<CommitId, Vec<CommitId>>,
         options: &RewriteRefsOptions,
@@ -1288,8 +1185,7 @@ impl MutableRepo {
                 RefTarget::from_merge(MergeBuilder::from_iter(ids).build())
             };
 
-            self.merge_local_bookmark(&bookmark_name, &old_target, &new_target)
-                .await?;
+            self.merge_local_bookmark(&bookmark_name, &old_target, &new_target)?;
         }
         Ok(())
     }
@@ -1335,10 +1231,6 @@ impl MutableRepo {
                 .await
                 .map_err(|err| match err {
                     EditCommitError::BackendError(backend_error) => backend_error,
-                    // TODO: index error shouldn't be a "BackendError"
-                    EditCommitError::IndexError(index_error) => {
-                        BackendError::Other(index_error.into())
-                    }
                     EditCommitError::WorkingCopyCommitNotFound(_)
                     | EditCommitError::RewriteRootCommit(_) => panic!("unexpected error: {err:?}"),
                 })?;
@@ -1365,9 +1257,6 @@ impl MutableRepo {
         }
         view.head_ids.extend(heads_to_add);
         self.set_view(view);
-        // TODO: indexing error shouldn't be a "RevsetEvaluationError"
-        self.normalize_heads()
-            .map_err(|err| RevsetEvaluationError::Other(Box::new(err)))?;
         Ok(())
     }
 
@@ -1620,13 +1509,13 @@ impl MutableRepo {
         if &commit_id == self.store().root_commit_id() {
             return Err(RewriteRootCommit);
         }
-        self.view.set_wc_commit(name, commit_id);
+        self.view_mut().set_wc_commit(name, commit_id);
         Ok(())
     }
 
     pub async fn remove_wc_commit(&mut self, name: &WorkspaceName) -> Result<(), EditCommitError> {
         self.maybe_abandon_wc_commit(name).await?;
-        self.view.remove_wc_commit(name);
+        self.view_mut().remove_wc_commit(name);
         Ok(())
     }
 
@@ -1638,7 +1527,8 @@ impl MutableRepo {
         base_id: Option<&CommitId>,
         other_id: Option<&CommitId>,
     ) {
-        let self_id = self.view.get_wc_commit_id(name);
+        let view = self.view.get_mut();
+        let self_id = view.get_wc_commit_id(name);
         // Not using merge_ref_targets(). Since the working-copy pointer moves
         // towards random direction, it doesn't make sense to resolve conflict
         // based on ancestry.
@@ -1654,8 +1544,8 @@ impl MutableRepo {
             self_id.cloned()
         };
         match new_id {
-            Some(id) => self.view.set_wc_commit(name.to_owned(), id),
-            None => self.view.remove_wc_commit(name),
+            Some(id) => view.set_wc_commit(name.to_owned(), id),
+            None => view.remove_wc_commit(name),
         }
     }
 
@@ -1664,7 +1554,7 @@ impl MutableRepo {
         old_name: &WorkspaceName,
         new_name: WorkspaceNameBuf,
     ) -> Result<(), RenameWorkspaceError> {
-        self.view.rename_workspace(old_name, new_name)
+        self.view_mut().rename_workspace(old_name, new_name)
     }
 
     pub async fn check_out(
@@ -1707,18 +1597,19 @@ impl MutableRepo {
             .any(|id| id == commit_id)
         };
 
-        let maybe_wc_commit_id = self.view.get_wc_commit_id(workspace_name).cloned();
+        let maybe_wc_commit_id = self
+            .view
+            .with_ref(|v| v.get_wc_commit_id(workspace_name).cloned());
         if let Some(wc_commit_id) = maybe_wc_commit_id {
             let wc_commit = self
                 .store()
                 .get_commit_async(&wc_commit_id)
                 .await
                 .map_err(EditCommitError::WorkingCopyCommitNotFound)?;
-            // Call normalized_heads() prior to .view().heads().contains() because
-            // the caller expects non-head revisions don't exist in the set.
-            self.normalize_heads()?;
             if wc_commit.is_discardable(self).await?
-                && !is_commit_referenced(&self.view, wc_commit.id())
+                && self
+                    .view
+                    .with_ref(|v| !is_commit_referenced(v, wc_commit.id()))
                 && self.view().heads().contains(wc_commit.id())
             {
                 // Abandon the working-copy commit we're leaving if it's
@@ -1729,6 +1620,28 @@ impl MutableRepo {
         }
 
         Ok(())
+    }
+
+    fn enforce_view_invariants(&self, view: &mut View) {
+        let view = view.store_view_mut();
+        let root_commit_id = self.store().root_commit_id();
+        if view.head_ids.is_empty() {
+            view.head_ids.insert(root_commit_id.clone());
+        } else if view.head_ids.len() > 1 {
+            // An empty head_ids set is padded with the root_commit_id, but the
+            // root id is unwanted during the heads resolution.
+            view.head_ids.remove(root_commit_id);
+            // It is unclear if `heads` can never fail for default implementation,
+            // but it can definitely fail for non-default implementations.
+            // TODO: propagate errors.
+            view.head_ids = self
+                .index()
+                .heads(&mut view.head_ids.iter())
+                .unwrap()
+                .into_iter()
+                .collect();
+        }
+        assert!(!view.head_ids.is_empty());
     }
 
     /// Ensures that the given `head` and ancestor commits are reachable from
@@ -1744,7 +1657,7 @@ impl MutableRepo {
     /// and ancestors of the other heads. The `heads` and ancestor commits
     /// should exist in the store.
     pub async fn add_heads(&mut self, heads: &[Commit]) -> BackendResult<()> {
-        let current_heads = self.view.heads();
+        let current_heads = self.view.get_mut().heads();
         // Use incremental update for common case of adding a single commit on top a
         // current head. TODO: Also use incremental update when adding a single
         // commit on top a non-head.
@@ -1761,21 +1674,25 @@ impl MutableRepo {
                     .await
                     // TODO: indexing error shouldn't be a "BackendError"
                     .map_err(|err| BackendError::Other(err.into()))?;
-                self.view
-                    .replace_heads(head.id().clone(), head.parent_ids());
+                self.view.get_mut().add_head(head.id());
+                for parent_id in head.parent_ids() {
+                    self.view.get_mut().remove_head(parent_id);
+                }
             }
             _ => {
                 self.index_commits(heads).await?;
                 for head in heads {
-                    self.view.add_head(head.id());
+                    self.view.get_mut().add_head(head.id());
                 }
+                self.view.mark_dirty();
             }
         }
         Ok(())
     }
 
     pub fn remove_head(&mut self, head: &CommitId) {
-        self.view.remove_head(head);
+        self.view_mut().remove_head(head);
+        self.view.mark_dirty();
     }
 
     /// Adds the given `heads` and ancestor commits to the index without making
@@ -1825,57 +1742,61 @@ impl MutableRepo {
     }
 
     pub fn get_local_bookmark(&self, name: &RefName) -> RefTarget {
-        self.view.get_local_bookmark(name).clone()
+        self.view.with_ref(|v| v.get_local_bookmark(name).clone())
     }
 
     pub fn set_local_bookmark_target(&mut self, name: &RefName, target: RefTarget) {
+        let view = self.view_mut();
         for id in target.added_ids() {
-            self.view.add_head(id);
+            view.add_head(id);
         }
-        self.view.set_local_bookmark_target(name, target);
+        view.set_local_bookmark_target(name, target);
+        self.view.mark_dirty();
     }
 
-    pub async fn merge_local_bookmark(
+    pub fn merge_local_bookmark(
         &mut self,
         name: &RefName,
         base_target: &RefTarget,
         other_target: &RefTarget,
     ) -> IndexResult<()> {
+        let view = self.view.get_mut();
         let index = self.index.as_index();
-        let self_target = self.view.get_local_bookmark(name);
-        let new_target = merge_ref_targets(index, self_target, base_target, other_target).await?;
+        let self_target = view.get_local_bookmark(name);
+        let new_target = merge_ref_targets(index, self_target, base_target, other_target)?;
         self.set_local_bookmark_target(name, new_target);
         Ok(())
     }
 
     pub fn get_remote_bookmark(&self, symbol: RemoteRefSymbol<'_>) -> RemoteRef {
-        self.view.get_remote_bookmark(symbol).clone()
+        self.view
+            .with_ref(|v| v.get_remote_bookmark(symbol).clone())
     }
 
     pub fn set_remote_bookmark(&mut self, symbol: RemoteRefSymbol<'_>, remote_ref: RemoteRef) {
-        self.view.set_remote_bookmark(symbol, remote_ref);
+        self.view_mut().set_remote_bookmark(symbol, remote_ref);
     }
 
-    async fn merge_remote_bookmark(
+    fn merge_remote_bookmark(
         &mut self,
         symbol: RemoteRefSymbol<'_>,
         base_ref: &RemoteRef,
         other_ref: &RemoteRef,
     ) -> IndexResult<()> {
+        let view = self.view.get_mut();
         let index = self.index.as_index();
-        let self_ref = self.view.get_remote_bookmark(symbol);
-        let new_ref = merge_remote_refs(index, self_ref, base_ref, other_ref).await?;
-        self.view.set_remote_bookmark(symbol, new_ref);
+        let self_ref = view.get_remote_bookmark(symbol);
+        let new_ref = merge_remote_refs(index, self_ref, base_ref, other_ref)?;
+        view.set_remote_bookmark(symbol, new_ref);
         Ok(())
     }
 
     /// Merges the specified remote bookmark in to local bookmark, and starts
     /// tracking it.
-    pub async fn track_remote_bookmark(&mut self, symbol: RemoteRefSymbol<'_>) -> IndexResult<()> {
+    pub fn track_remote_bookmark(&mut self, symbol: RemoteRefSymbol<'_>) -> IndexResult<()> {
         let mut remote_ref = self.get_remote_bookmark(symbol);
         let base_target = remote_ref.tracked_target();
-        self.merge_local_bookmark(symbol.name, base_target, &remote_ref.target)
-            .await?;
+        self.merge_local_bookmark(symbol.name, base_target, &remote_ref.target)?;
         remote_ref.state = RemoteRefState::Tracked;
         self.set_remote_bookmark(symbol, remote_ref);
         Ok(())
@@ -1889,109 +1810,94 @@ impl MutableRepo {
     }
 
     pub fn ensure_remote(&mut self, remote_name: &RemoteName) {
-        self.view.ensure_remote(remote_name);
+        self.view_mut().ensure_remote(remote_name);
     }
 
     pub fn remove_remote(&mut self, remote_name: &RemoteName) {
-        self.view.remove_remote(remote_name);
+        self.view_mut().remove_remote(remote_name);
     }
 
     pub fn rename_remote(&mut self, old: &RemoteName, new: &RemoteName) {
-        self.view.rename_remote(old, new);
+        self.view_mut().rename_remote(old, new);
     }
 
     pub fn get_local_tag(&self, name: &RefName) -> RefTarget {
-        self.view.get_local_tag(name).clone()
+        self.view.with_ref(|v| v.get_local_tag(name).clone())
     }
 
     pub fn set_local_tag_target(&mut self, name: &RefName, target: RefTarget) {
-        self.view.set_local_tag_target(name, target);
+        self.view_mut().set_local_tag_target(name, target);
     }
 
-    pub async fn merge_local_tag(
+    pub fn merge_local_tag(
         &mut self,
         name: &RefName,
         base_target: &RefTarget,
         other_target: &RefTarget,
     ) -> IndexResult<()> {
+        let view = self.view.get_mut();
         let index = self.index.as_index();
-        let self_target = self.view.get_local_tag(name);
-        let new_target = merge_ref_targets(index, self_target, base_target, other_target).await?;
-        self.view.set_local_tag_target(name, new_target);
+        let self_target = view.get_local_tag(name);
+        let new_target = merge_ref_targets(index, self_target, base_target, other_target)?;
+        view.set_local_tag_target(name, new_target);
         Ok(())
     }
 
     pub fn get_remote_tag(&self, symbol: RemoteRefSymbol<'_>) -> RemoteRef {
-        self.view.get_remote_tag(symbol).clone()
+        self.view.with_ref(|v| v.get_remote_tag(symbol).clone())
     }
 
     pub fn set_remote_tag(&mut self, symbol: RemoteRefSymbol<'_>, remote_ref: RemoteRef) {
-        self.view.set_remote_tag(symbol, remote_ref);
+        self.view_mut().set_remote_tag(symbol, remote_ref);
     }
 
-    async fn merge_remote_tag(
+    fn merge_remote_tag(
         &mut self,
         symbol: RemoteRefSymbol<'_>,
         base_ref: &RemoteRef,
         other_ref: &RemoteRef,
     ) -> IndexResult<()> {
+        let view = self.view.get_mut();
         let index = self.index.as_index();
-        let self_ref = self.view.get_remote_tag(symbol);
-        let new_ref = merge_remote_refs(index, self_ref, base_ref, other_ref).await?;
-        self.view.set_remote_tag(symbol, new_ref);
+        let self_ref = view.get_remote_tag(symbol);
+        let new_ref = merge_remote_refs(index, self_ref, base_ref, other_ref)?;
+        view.set_remote_tag(symbol, new_ref);
         Ok(())
-    }
-
-    /// Merges the specified remote tag in to local tag, and starts tracking it.
-    pub async fn track_remote_tag(&mut self, symbol: RemoteRefSymbol<'_>) -> IndexResult<()> {
-        let mut remote_ref = self.get_remote_tag(symbol);
-        let base_target = remote_ref.tracked_target();
-        self.merge_local_tag(symbol.name, base_target, &remote_ref.target)
-            .await?;
-        remote_ref.state = RemoteRefState::Tracked;
-        self.set_remote_tag(symbol, remote_ref);
-        Ok(())
-    }
-
-    /// Stops tracking the specified remote tag.
-    pub fn untrack_remote_tag(&mut self, symbol: RemoteRefSymbol<'_>) {
-        let mut remote_ref = self.get_remote_tag(symbol);
-        remote_ref.state = RemoteRefState::New;
-        self.set_remote_tag(symbol, remote_ref);
     }
 
     pub fn get_git_ref(&self, name: &GitRefName) -> RefTarget {
-        self.view.get_git_ref(name).clone()
+        self.view.with_ref(|v| v.get_git_ref(name).clone())
     }
 
     pub fn set_git_ref_target(&mut self, name: &GitRefName, target: RefTarget) {
-        self.view.set_git_ref_target(name, target);
+        self.view_mut().set_git_ref_target(name, target);
     }
 
-    async fn merge_git_ref(
+    fn merge_git_ref(
         &mut self,
         name: &GitRefName,
         base_target: &RefTarget,
         other_target: &RefTarget,
     ) -> IndexResult<()> {
+        let view = self.view.get_mut();
         let index = self.index.as_index();
-        let self_target = self.view.get_git_ref(name);
-        let new_target = merge_ref_targets(index, self_target, base_target, other_target).await?;
-        self.view.set_git_ref_target(name, new_target);
+        let self_target = view.get_git_ref(name);
+        let new_target = merge_ref_targets(index, self_target, base_target, other_target)?;
+        view.set_git_ref_target(name, new_target);
         Ok(())
     }
 
     pub fn git_head(&self) -> RefTarget {
-        self.view.git_head().clone()
+        self.view.with_ref(|v| v.git_head().clone())
     }
 
     pub fn set_git_head_target(&mut self, target: RefTarget) {
-        self.view.set_git_head_target(target);
+        self.view_mut().set_git_head_target(target);
     }
 
     pub fn set_view(&mut self, data: op_store::View) {
-        let head_normalized = false;
-        self.view.set_view(data, head_normalized);
+        self.view_mut().set_view(data);
+        self.view.mark_dirty();
     }
 
     pub async fn merge(
@@ -2006,9 +1912,9 @@ impl MutableRepo {
         self.index.merge_in(base_repo.readonly_index())?;
         self.index.merge_in(other_repo.readonly_index())?;
 
-        self.normalize_heads()?;
-
+        self.view.ensure_clean(|v| self.enforce_view_invariants(v));
         self.merge_view(&base_repo.view, &other_repo.view).await?;
+        self.view.mark_dirty();
         Ok(())
     }
 
@@ -2039,42 +1945,39 @@ impl MutableRepo {
             // marked them abandoned or rewritten.
         } else {
             for removed_head in base.heads().difference(other.heads()) {
-                self.view.remove_head(removed_head);
+                self.view_mut().remove_head(removed_head);
             }
         }
         for added_head in other.heads().difference(base.heads()) {
-            self.view.add_head(added_head);
+            self.view_mut().add_head(added_head);
         }
 
         let changed_local_bookmarks =
             diff_named_ref_targets(base.local_bookmarks(), other.local_bookmarks());
         for (name, (base_target, other_target)) in changed_local_bookmarks {
-            self.merge_local_bookmark(name, base_target, other_target)
-                .await?;
+            self.merge_local_bookmark(name, base_target, other_target)?;
         }
 
         let changed_local_tags = diff_named_ref_targets(base.local_tags(), other.local_tags());
         for (name, (base_target, other_target)) in changed_local_tags {
-            self.merge_local_tag(name, base_target, other_target)
-                .await?;
+            self.merge_local_tag(name, base_target, other_target)?;
         }
 
         let changed_git_refs = diff_named_ref_targets(base.git_refs(), other.git_refs());
         for (name, (base_target, other_target)) in changed_git_refs {
-            self.merge_git_ref(name, base_target, other_target).await?;
+            self.merge_git_ref(name, base_target, other_target)?;
         }
 
         let changed_remote_bookmarks =
             diff_named_remote_refs(base.all_remote_bookmarks(), other.all_remote_bookmarks());
         for (symbol, (base_ref, other_ref)) in changed_remote_bookmarks {
-            self.merge_remote_bookmark(symbol, base_ref, other_ref)
-                .await?;
+            self.merge_remote_bookmark(symbol, base_ref, other_ref)?;
         }
 
         let changed_remote_tags =
             diff_named_remote_refs(base.all_remote_tags(), other.all_remote_tags());
         for (symbol, (base_ref, other_ref)) in changed_remote_tags {
-            self.merge_remote_tag(symbol, base_ref, other_ref).await?;
+            self.merge_remote_tag(symbol, base_ref, other_ref)?;
         }
 
         let new_git_head_target = merge_ref_targets(
@@ -2082,8 +1985,7 @@ impl MutableRepo {
             self.view().git_head(),
             base.git_head(),
             other.git_head(),
-        )
-        .await?;
+        )?;
         self.set_git_head_target(new_git_head_target);
 
         Ok(())
@@ -2180,7 +2082,8 @@ impl Repo for MutableRepo {
     }
 
     fn view(&self) -> &View {
-        &self.view
+        self.view
+            .get_or_ensure_clean(|v| self.enforce_view_invariants(v))
     }
 
     fn submodule_store(&self) -> &Arc<dyn SubmoduleStore> {
@@ -2215,8 +2118,6 @@ pub enum EditCommitError {
     RewriteRootCommit(#[from] RewriteRootCommit),
     #[error(transparent)]
     BackendError(#[from] BackendError),
-    #[error(transparent)]
-    IndexError(#[from] IndexError),
 }
 
 /// Error from attempts to check out a commit
@@ -2226,4 +2127,71 @@ pub enum CheckOutCommitError {
     CreateCommit(#[from] BackendError),
     #[error("Failed to edit commit")]
     EditCommit(#[from] EditCommitError),
+}
+
+mod dirty_cell {
+    use std::cell::OnceCell;
+    use std::cell::RefCell;
+
+    /// Cell that lazily updates the value after `mark_dirty()`.
+    ///
+    /// A clean value can be immutably borrowed within the `self` lifetime.
+    #[derive(Clone, Debug)]
+    pub struct DirtyCell<T> {
+        // Either clean or dirty value is set. The value is boxed to reduce stack space
+        // and memcopy overhead.
+        clean: OnceCell<Box<T>>,
+        dirty: RefCell<Option<Box<T>>>,
+    }
+
+    impl<T> DirtyCell<T> {
+        pub fn with_clean(value: T) -> Self {
+            Self {
+                clean: OnceCell::from(Box::new(value)),
+                dirty: RefCell::new(None),
+            }
+        }
+
+        pub fn get_or_ensure_clean(&self, f: impl FnOnce(&mut T)) -> &T {
+            self.clean.get_or_init(|| {
+                // Panics if ensure_clean() is invoked from with_ref() callback for example.
+                let mut value = self.dirty.borrow_mut().take().unwrap();
+                f(&mut value);
+                value
+            })
+        }
+
+        pub fn ensure_clean(&self, f: impl FnOnce(&mut T)) {
+            self.get_or_ensure_clean(f);
+        }
+
+        pub fn into_inner(self) -> T {
+            *self
+                .clean
+                .into_inner()
+                .or_else(|| self.dirty.into_inner())
+                .unwrap()
+        }
+
+        pub fn with_ref<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+            if let Some(value) = self.clean.get() {
+                f(value)
+            } else {
+                f(self.dirty.borrow().as_ref().unwrap())
+            }
+        }
+
+        pub fn get_mut(&mut self) -> &mut T {
+            self.clean
+                .get_mut()
+                .or_else(|| self.dirty.get_mut().as_mut())
+                .unwrap()
+        }
+
+        pub fn mark_dirty(&mut self) {
+            if let Some(value) = self.clean.take() {
+                *self.dirty.get_mut() = Some(value);
+            }
+        }
+    }
 }
